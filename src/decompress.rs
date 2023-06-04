@@ -1,6 +1,9 @@
 //! See the `Decompress` struct instead. You don't need to use this module directly.
 use crate::ffi;
 use crate::ffi::jpeg_decompress_struct;
+use crate::ffi::jpeg_common_struct;
+use crate::ffi::jvirt_barray_control;
+use crate::ffi::JDIMENSION;
 use crate::ffi::DCTSIZE;
 use crate::ffi::JPEG_LIB_VERSION;
 use crate::ffi::J_COLOR_SPACE as COLOR_SPACE;
@@ -226,7 +229,44 @@ impl<'src> Decompress<'src> {
         }
     }
 
-    #[cfg(all(unix, not(target_arch="wasm32")))]
+
+    pub fn read_dct_coefficients(&mut self) -> Vec<Vec<Vec<i16>>> {
+        let mut dct_coefficients: Vec<Vec<Vec<i16>>> = Vec::with_capacity(self.components().len());
+        unsafe {
+            let coef_arrays = ffi::jpeg_read_coefficients(&mut self.cinfo);
+            let mut common_ptr: jpeg_common_struct = mem::zeroed();
+            let barray_control_fn = (*self.cinfo.common.mem).access_virt_barray.unwrap();
+            for (c_id, comp) in self.components().iter().enumerate() {
+                let height_in_blocks = comp.height_in_blocks;
+                let width_in_blocks = comp.width_in_blocks;
+
+                let mut component_coef: Vec<Vec<i16>> =
+                    vec![
+                        vec![0; width_in_blocks as usize * DCTSIZE];
+                        height_in_blocks as usize * DCTSIZE
+                    ];
+
+                let v = coef_arrays.offset(c_id as isize);
+                for blk_y in 0..height_in_blocks {
+                    
+                    let buff_ptr = barray_control_fn(&mut common_ptr, *v, blk_y, 1, 0);
+                    for blk_x in 0..width_in_blocks {
+                        let buffer = (*buff_ptr).offset(blk_x as isize);
+                        for i in 0..DCTSIZE {
+                            for j in 0..DCTSIZE {
+                                component_coef[i + blk_y as usize * DCTSIZE]
+                                    [j + blk_x as usize * DCTSIZE] = (*buffer)[i * DCTSIZE + j];
+                            }
+                        }
+                    }
+                }
+                dct_coefficients.push(component_coef);
+            }
+        };
+        dct_coefficients
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     fn set_file_src(&mut self, file: Box<File>) -> io::Result<()> {
         unsafe {
             let fh = fdopen(file.as_raw_fd(), b"rb".as_ptr() as *const _);
@@ -691,4 +731,31 @@ fn read_file_rgb() {
     assert!(!bitmap.contains(&[0; 3]));
 
     assert!(dinfo.finish_decompress());
+}
+
+#[test]
+fn read_dct_coefficients() {
+    use std::fs::File;
+    use std::io::Read;
+
+    let mut data = Vec::new();
+
+    File::open("tests/test.jpg").unwrap().read_to_end(&mut data).unwrap();
+    let mut dinfo = Decompress::with_markers(ALL_MARKERS).from_mem(&data[..]).unwrap();
+
+    let dct_coefficients = dinfo.read_dct_coefficients();
+    assert_eq!(dct_coefficients.len(), dinfo.components().len());
+
+    let exp_sizes = vec![
+        (32, 48),
+        (16, 24),
+        (16, 24)
+    ];
+
+    for (c_id, coef_matrix) in dct_coefficients.iter().enumerate() {
+        assert_eq!(exp_sizes[c_id].0, coef_matrix.len());
+        for row in coef_matrix {
+            assert_eq!(exp_sizes[c_id].1, row.len());
+        }
+    }
 }
